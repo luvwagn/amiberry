@@ -8,6 +8,7 @@
 #include "zz9000_sdk_internal.h"
 #include "zz9000_sdk_audio_codec.h"
 #include "zz9000_sdk_media_av.h"
+#include "zz9000_sdk_media_output.h"
 #include "zz9000_sdk_console.h"
 #include "zz9000_sdk_webp.h"
 
@@ -230,6 +231,16 @@ struct Engine::Media {
 	// the 0x0b08 present copy and the pl_mpeg decode and pack paths.
 	uint64_t profile_us[4] = {};
 	uint64_t profile_calls[4] = {};
+	// ZZ9K_VIDEO_OUTPUT_SHARED_BUFFER: pictures are scaled and converted
+	// into one of two host-visible slots instead of the PIP.
+	uint32_t output_format = video_output_direct_overlay;
+	bool output_configured = false;
+	uint32_t output_handle = 0, output_offset = 0, output_stride = 0;
+	uint32_t output_next_slot = 0, output_last_slot = 0;
+	uint64_t output_completed = 0;
+	uint64_t output_pts = UINT64_MAX;
+	MediaOutputConverter output;
+	std::vector<uint8_t> output_rgb;
 };
 
 Engine::Engine(uint8_t *board_memory, uint32_t board_size)
@@ -927,7 +938,9 @@ uint16_t Engine::dispatch_media(uint16_t opcode, const uint8_t *request,
 		const uint32_t container = be32(request + 4);
 		const uint32_t width = be32(request + 8), height = be32(request + 12);
 		const uint32_t audio_codec = be32(request + 20);
-		if (be32(request + 16) != 1 || be32(request + 40))
+		const uint32_t output_format = be32(request + 16);
+		if ((output_format != video_output_direct_overlay &&
+		     output_format != video_output_shared_buffer) || be32(request + 40))
 			return unsupported;
 		const bool legacy_mpeg1 = video_codec == 1 && container == 1 &&
 			(audio_codec == 0 || audio_codec == 1);
@@ -965,6 +978,7 @@ uint16_t Engine::dispatch_media(uint16_t opcode, const uint8_t *request,
 		media_->width = width; media_->height = height;
 		media_->video_codec = video_codec; media_->container = container;
 		media_->audio_enabled = audio_codec != 0;
+		media_->output_format = output_format;
 		media_->pcm_handle = pcm_handle;
 		media_->pcm_capacity = pcm_capacity;
 		media_->pcm_low_water = low;
@@ -994,6 +1008,8 @@ uint16_t Engine::dispatch_media(uint16_t opcode, const uint8_t *request,
 	}
 	if (request_length < 16 || !media_ || be32(request) != media_->session)
 		return request_length < 16 ? bad_request : bad_handle;
+	if (opcode == 0x0b0e)
+		return media_output_config(request, request_length, reply, reply_length);
 	if (opcode == 0x0b05) {
 		const uint32_t handle = be32(request + 4);
 		const uint32_t offset = be32(request + 8);
@@ -1196,6 +1212,9 @@ uint16_t Engine::dispatch_media(uint16_t opcode, const uint8_t *request,
 			return bad_request;
 		if (!media_->held || (!media_->av && !media_->held_frame))
 			return bad_request;
+		if (opcode == 0x0b08 &&
+		    media_->output_format == video_output_shared_buffer)
+			return media_output_present(reply, reply_length);
 		if (opcode == 0x0b08) {
 			if (!overlay_.active)
 				return busy;
@@ -1294,7 +1313,7 @@ uint16_t Engine::dispatch_media(uint16_t opcode, const uint8_t *request,
 		if (request_length < 12 || be32(request + 8))
 			return bad_request;
 		const uint32_t page = be32(request + 4);
-		if (page > 5)
+		if (page > 6)
 			return bad_request;
 		put32(reply, media_->session);
 		put32(reply + 4, media_->state);
@@ -1365,6 +1384,20 @@ uint16_t Engine::dispatch_media(uint16_t opcode, const uint8_t *request,
 			// pattern and are sign-extended by the reader.
 			put64(reply + 32, pack_pair(overlay_.dst_x, overlay_.dst_y));
 			put64(reply + 40, pack_pair(overlay_.screen_w, overlay_.screen_h));
+		} else if (page == 6) {
+			// ZZ9K_MEDIA_STATUS_OUTPUT: the shared-buffer output's newest
+			// complete picture. An overlay session reports nothing here.
+			const bool shared = media_->output_format == video_output_shared_buffer &&
+				media_->output_configured;
+			const auto &config = media_->output.config();
+			put32(reply + 12, shared ? 1u | (media_->output_completed ? 2u : 0u) |
+				(media_->output_completed && media_->output_last_slot ? 4u : 0u) : 0u);
+			put64(reply + 16, shared ? media_->output_completed : 0);
+			put64(reply + 24, shared ? media_->output_pts : 0);
+			put64(reply + 32, shared ? pack_pair(static_cast<int32_t>(config.width),
+				static_cast<int32_t>(config.height)) : 0);
+			put64(reply + 40, shared ? (static_cast<uint64_t>(config.format) << 32) |
+				config.pitch : 0);
 		} else {
 			// Per-stage timing as (microseconds << 32) | calls, cumulative
 			// for the session. NEON_PACK never applies: the host packs in
@@ -1404,6 +1437,111 @@ uint16_t Engine::dispatch_media(uint16_t opcode, const uint8_t *request,
 	return unsupported;
 }
 
+// ZZ9K_OP_MEDIA_SESSION_OUTPUT_CONFIG: where and how a shared-buffer session
+// writes its pictures. Payload: session, buffer handle, offset, slot stride,
+// width, height, format, pitch, flags, palette handle, palette offset,
+// reserved.
+uint16_t Engine::media_output_config(const uint8_t *request, uint16_t request_length,
+	                                 uint8_t *reply, uint16_t *reply_length)
+{
+	if (request_length < 48 || be32(request + 44))
+		return bad_request;
+	if (media_->output_format != video_output_shared_buffer)
+		return bad_request;
+	MediaOutputConfig config;
+	const uint32_t handle = be32(request + 4);
+	const uint32_t offset = be32(request + 8);
+	const uint32_t stride = be32(request + 12);
+	config.width = be32(request + 16);
+	config.height = be32(request + 20);
+	config.format = be32(request + 24);
+	config.pitch = be32(request + 28);
+	config.flags = be32(request + 32);
+	const uint32_t palette_handle = be32(request + 36);
+	const uint32_t palette_offset = be32(request + 40);
+	const uint64_t picture = media_output_picture_bytes(config);
+	if (!picture)
+		return bad_request;
+	// Pictures must land where the host can read them: never card-only.
+	const auto *buffer = find_buffer(handle);
+	if (!buffer || buffer->card_only)
+		return bad_handle;
+	if (stride && stride < picture)
+		return bad_request;
+	if (static_cast<uint64_t>(offset) + stride + picture > buffer->length)
+		return bad_request;
+	const bool indexed = media_output_indexed(config);
+	const bool host_palette = (config.flags & output_palette_host) != 0;
+	uint8_t *palette_bytes = nullptr;
+	if (palette_handle) {
+		const auto *palette = find_buffer(palette_handle);
+		if (!palette || palette->card_only)
+			return bad_handle;
+		if (!indexed || static_cast<uint64_t>(palette_offset) + 1024 > palette->length)
+			return bad_request;
+		palette_bytes = buffer_data(palette_handle) + palette_offset;
+	} else if (host_palette || palette_offset) {
+		return bad_request;
+	}
+	uint32_t palette[256] = {};
+	if (host_palette)
+		for (uint32_t i = 0; i < 256; ++i)
+			palette[i] = be32(palette_bytes + i * 4) & 0x00ffffffu;
+	media_->output.configure(config, host_palette ? palette : nullptr);
+	if (palette_bytes && !host_palette) {
+		// Hand the host the fixed palette before the first picture.
+		media_output_fixed_palette(media_output_depth(config), palette);
+		for (uint32_t i = 0; i < 256; ++i)
+			put32(palette_bytes + i * 4, palette[i]);
+	}
+	media_->output_configured = true;
+	media_->output_handle = handle;
+	media_->output_offset = offset;
+	media_->output_stride = stride;
+	media_->output_next_slot = 0;
+	media_result(reply, reply_length);
+	return ok;
+}
+
+// PRESENT for a shared-buffer session: convert the held picture into the
+// slot not written last. The emulator finishes the write before replying,
+// so OUTPUT_PENDING is never set.
+uint16_t Engine::media_output_present(uint8_t *reply, uint16_t *reply_length)
+{
+	if (!media_->output_configured)
+		return bad_request;
+	const auto *buffer = find_buffer(media_->output_handle);
+	if (!buffer)
+		return bad_handle; // freed under the session
+	const uint64_t present_start = monotonic_us();
+	if (media_->av) {
+		media_yuy2_to_rgb(media_->held_yuy2.data(), media_->width, media_->height,
+			media_->held_interlaced, media_->output_rgb);
+	} else {
+		const auto *frame = media_->held_frame;
+		media_yuv420_to_rgb(frame->y.data, frame->y.width, frame->cb.data,
+			frame->cr.data, frame->cb.width, media_->width, media_->height,
+			media_->output_rgb);
+	}
+	const uint32_t slot = media_->output_stride ? media_->output_next_slot : 0;
+	uint8_t *dst = buffer_data(media_->output_handle) + media_->output_offset +
+		static_cast<size_t>(slot) * media_->output_stride;
+	media_->output.convert(media_->output_rgb.data(), media_->width, media_->height, dst);
+	media_->profile_us[2] += monotonic_us() - present_start;
+	media_->profile_calls[2]++;
+	media_->output_last_slot = slot;
+	media_->output_next_slot = slot ^ 1u;
+	media_->output_completed++;
+	media_->output_pts = media_->video_pts;
+	media_->held = false;
+	media_->held_interlaced = false;
+	media_->held_frame = nullptr;
+	media_->state = 2;
+	media_->presented_frames++;
+	media_result(reply, reply_length, 0, (1u << 9) | (slot ? 1u << 15 : 0u));
+	return ok;
+}
+
 uint16_t Engine::dispatch_console(const uint8_t *request, uint16_t request_length,
 	                              uint8_t *reply, uint16_t *reply_length)
 {
@@ -1430,7 +1568,7 @@ uint16_t Engine::dispatch(uint16_t opcode, const uint8_t *request,
 		return bad_request;
 	if (opcode == 0x8200)
 		return dispatch_console(request, request_length, reply, reply_length);
-	if (opcode >= 0x0b04 && opcode <= 0x0b0d)
+	if (opcode >= 0x0b04 && opcode <= 0x0b0e)
 		return dispatch_media(opcode, request, request_length, reply, reply_length);
 	if (opcode == 0x0000)
 		return ok;
@@ -1511,7 +1649,9 @@ uint16_t Engine::dispatch(uint16_t opcode, const uint8_t *request,
 #else
 			8 :
 #endif
-			service == 0x0b00 ? 14 : service == 0x8200 ? 1 : 23);
+			// Video: 0x0b00-0x0b0e; OUTPUT_CONFIG (0x0b0e) is how clients find the
+			// shared-buffer output.
+			service == 0x0b00 ? 15 : service == 0x8200 ? 1 : 23);
 		put32(reply + 24, 48);
 		const char *name = service == 0 ? "core" : service == 0x100 ?
 			"memory" : service == 0x200 ? "surface" : service == 0x400 ? "image" :

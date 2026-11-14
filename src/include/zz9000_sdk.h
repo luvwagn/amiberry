@@ -119,6 +119,9 @@ private:
 	                  uint32_t bytes_written = 0, uint32_t event_flags = 0);
 	void media_audio_result(uint8_t *reply, uint16_t *reply_length);
 	void pump_media_audio();
+	uint16_t media_output_config(const uint8_t *request, uint16_t request_length,
+	                             uint8_t *reply, uint16_t *reply_length);
+	uint16_t media_output_present(uint8_t *reply, uint16_t *reply_length);
 	uint16_t dispatch_media(uint16_t opcode, const uint8_t *request,
 	                        uint16_t request_length, uint8_t *reply,
 	                        uint16_t *reply_length);

@@ -116,7 +116,8 @@ is not advertised, so ZZPlay plays the sound through guest AHI. Zorro II video
 sessions remain unadvertised because its video window aperture is not mapped
 for this path.
 
-The media status op (`0x0b0a`) answers all six card pages: timing (with the
+The media status op (`0x0b0a`) answers all six card pages, plus the
+shared-buffer output page described below: timing (with the
 timeline origin), audio, counters (decoded, presented and discarded frames
 counted separately), audio output (zero underruns — there is no card-side
 DMA pump here to starve), the overlay presentation path, and per-stage
@@ -127,8 +128,30 @@ the native path, and ZZPlay names it "native 1:1" or "native scaled" rather
 than "card-local compositor". Profiling packs each stage as
 `(microseconds << 32) | calls` measured around the real FFmpeg/pl_mpeg
 decode, YUY2 pack, present copy and audio decode work; the NEON flag never
-appears because the host packs in scalar C++. Pages above five and nonzero
+appears because the host packs in scalar C++. Pages above six and nonzero
 flags are rejected exactly as on the card.
+
+### Shared-buffer output (proposed, zz9000-firmware #238)
+
+BEGIN also accepts `output_format` 2, `ZZ9K_VIDEO_OUTPUT_SHARED_BUFFER`:
+the session then needs no PIP, and each PRESENT scales and converts the
+held picture into a host-visible shared buffer instead, so a program can
+show video on a native screen or another RTG card. The output is set with
+a new op, `MEDIA_SESSION_OUTPUT_CONFIG` (`0x0b0e`, which is why the video
+service reports 15 opcodes): buffer handle and offset, the stride between
+two slots (0 for one), output width and height, format (INDEX8, PLANAR
+with 1-8 planes separate or interleaved, big-endian RGB565 or RGB555),
+pitch, and flags for ordered or Floyd-Steinberg dithering, nearest
+scaling and a host-supplied palette. Without a host palette the card's
+fixed RGB-cube palette is written to the palette buffer when the output is
+configured. PRESENT writes to the slot not written last and sets result
+flag bit 15 when that slot is 1; the emulator finishes the write before
+replying, so the "still writing" bit 16 never appears. Status page 6
+reports the number of pictures written, the newest one's PTS and slot, and
+the output geometry. Pictures are converted with BT.601 limited-range
+colour and scaled with a tent filter (area-averaging when shrinking).
+Zorro II sessions are still not offered. The ABI is a proposal until the
+firmware adopts it.
 
 ## Console encoder
 
@@ -147,14 +170,17 @@ unadvertised and return `UNSUPPORTED`.
 ## Tests
 
 `tests/test_zz9000_sdk.sh`, `tests/test_zz9000_sdk_audio.sh`,
-`tests/test_zz9000_sdk_image.sh`, `tests/test_zz9000_sdk_media.sh` and
+`tests/test_zz9000_sdk_image.sh`, `tests/test_zz9000_sdk_media.sh`,
+`tests/test_zz9000_sdk_media_output.sh` and
 `tests/test_zz9000_sdk_console.sh` build the SDK against whichever optional
 libraries `pkg-config` finds and generate their fixtures with the `ffmpeg`
 command-line tool. They cover mailbox completion, allocation, reset and
 preload buffers; MP3, FLAC and Vorbis PCM against FFmpeg-decoded references
 and chunked feeding; JPEG, PNG and WebP pixels, limits and animation
 stepping; streaming playback of every supported container and codec pair,
-truncated input, and close/reopen; and console tile output.
+truncated input, and close/reopen; shared-buffer output formats, layouts,
+scaling, dithering, palettes, slot alternation and reconfiguration; and
+console tile output.
 
 ## Guest qualification
 

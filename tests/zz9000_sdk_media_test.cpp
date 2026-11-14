@@ -276,12 +276,19 @@ void run_ffmpeg_media(const char *path, uint32_t video_codec, uint32_t container
 		assert(std::all_of(guard, guard + 16, [](uint8_t value) { return value == 0xa5; }));
 		if (audio_codec)
 			assert(acknowledged > 0);
-		for (uint32_t page = 0; page <= 6; ++page) {
+		for (uint32_t page = 0; page <= 7; ++page) {
 			std::fill(std::begin(request), std::end(request), 0);
 			put32(request, session); put32(request + 4, page);
-			reply = mailbox.call(0x0b0a, request, 16, page <= 5 ? 0 : 4);
-			if (page > 5)
+			reply = mailbox.call(0x0b0a, request, 16, page <= 6 ? 0 : 4);
+			if (page > 6)
 				continue; // Past the last page the card answers BAD_REQUEST.
+			if (page == 6) {
+				// The shared-buffer output page is empty for an overlay session.
+				assert(get32(reply + 12) == 0);
+				for (uint32_t i = 0; i < 4; ++i)
+					assert(get64(reply + 16 + i * 8) == 0);
+				continue;
+			}
 			assert(get32(reply) == session);
 			assert(get32(reply + 8) == page);
 			if (page == 0 && expect_video) {
@@ -447,7 +454,7 @@ int main(int argc, char **argv)
 	uint8_t request[48] = {};
 	put32(request, 0x0b00);
 	const auto *reply = mailbox.call(0x0004, request, 4);
-	assert(get32(reply + 20) == 14 &&
+	assert(get32(reply + 20) == 15 &&
 	       (get32(reply + 12) & ((1u << 16) | (1u << 17) | (1u << 22))) ==
 	       ((1u << 16) | (1u << 17) | (1u << 22)));
 	const uint32_t staging = mailbox.allocate(65536);
