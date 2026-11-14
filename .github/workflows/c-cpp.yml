@@ -3,7 +3,8 @@ name: C/C++ CI
 on:
   workflow_dispatch:
   push:
-    branches: [master]
+    # Private builds: only build-windows runs for private/* branches.
+    branches: [master, 'private/**']
     tags:
       - 'v*'
       - 'preview-v*'
@@ -36,6 +37,7 @@ env:
 
 jobs:
   build-macOS:
+    if: ${{ !startsWith(github.ref_name, 'private/') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.arch == 'intel' && 120 || 45 }}
     permissions:
@@ -638,6 +640,7 @@ jobs:
           retention-days: 7
 
   build-ubuntu:
+    if: ${{ !startsWith(github.ref_name, 'private/') }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     # The 24.04-amd64 job also runs the test suite, except the slow settings
@@ -835,6 +838,7 @@ jobs:
           path: amiberry-*.zip
 
   test-host-architecture:
+    if: ${{ !startsWith(github.ref_name, 'private/') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -854,7 +858,7 @@ jobs:
     needs: [build-ubuntu]
     # Another Ubuntu leg's failure does not stop it; a failed 24.04 leg
     # leaves no package, and the download fails.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && !startsWith(github.ref_name, 'private/') }}
     runs-on: ubuntu-24.04
     container: ubuntu:24.04
     timeout-minutes: 45
@@ -890,6 +894,7 @@ jobs:
         run: sh tests/test_settings_schema.sh
 
   build-appimage:
+    if: ${{ !startsWith(github.ref_name, 'private/') }}
     runs-on: ${{ matrix.runner }}
     container: ubuntu:22.04
     timeout-minutes: 60
@@ -1084,6 +1089,7 @@ jobs:
           bash packaging/appimage/smoke-appimage.sh --image "${images[0]}" --mode extract
 
   build-fedora:
+    if: ${{ !startsWith(github.ref_name, 'private/') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -1153,6 +1159,7 @@ jobs:
         path: amiberry-*.zip
 
   build-debian-amd64:
+    if: ${{ !startsWith(github.ref_name, 'private/') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -1225,6 +1232,7 @@ jobs:
           path: "amiberry-*.zip"
 
   build-debian-arm64:
+    if: ${{ !startsWith(github.ref_name, 'private/') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -1829,6 +1837,7 @@ jobs:
   # is mandatory and a failure blocks the workflow (and downstream
   # create-release).
   build-windows-arm64:
+    if: ${{ !startsWith(github.ref_name, 'private/') }}
     runs-on: windows-11-arm
     # Cold-cache runs finish in ~24 min, warm-cache runs in ~8 min. The
     # extra time vs. x64 mostly comes from the InnoSetup-via-Chocolatey
@@ -2282,6 +2291,7 @@ jobs:
           retention-days: 7
 
   build-libretro:
+    if: ${{ !startsWith(github.ref_name, 'private/') }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
